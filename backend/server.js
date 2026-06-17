@@ -547,19 +547,57 @@ app.get("/api/dict", (req, res) => {
   });
 });
 
+const computeDeduction = (urgency_level) => {
+  if (urgency_level === "critical") return 10;
+  if (urgency_level === "high") return 5;
+  if (urgency_level === "medium") return 3;
+  return 1;
+};
+
+const refreshAllOverdueTasks = () => {
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const tasks = db
+    .prepare(
+      `SELECT * FROM collaboration_tasks 
+       WHERE status != 'completed' 
+         AND is_overdue = 0 
+         AND deadline < ?`,
+    )
+    .all(now);
+
+  if (tasks.length === 0) return;
+
+  const updateStmt = db.prepare(
+    "UPDATE collaboration_tasks SET is_overdue = 1, score_deducted = ?, status = 'overdue', updated_at = ? WHERE id = ?",
+  );
+  const receiptStmt = db.prepare(
+    `INSERT INTO task_receipts (task_id, action, department, operator, remark, created_at)
+     VALUES (?, '超时', ?, '系统', ?, ?)`,
+  );
+
+  const txn = db.transaction(() => {
+    for (const task of tasks) {
+      const deduction = computeDeduction(task.urgency_level);
+      updateStmt.run(deduction, now, task.id);
+      receiptStmt.run(
+        task.id,
+        task.receive_department,
+        `任务已超过时限，扣考核分 ${deduction} 分`,
+        now,
+      );
+    }
+  });
+
+  txn();
+};
+
 const checkOverdueAndDeduct = (task, now) => {
   if (
     task.status !== "completed" &&
-    task.status !== "pending_acknowledge" &&
     !task.is_overdue &&
     new Date(task.deadline) < new Date(now)
   ) {
-    const hours = DEADLINE_HOURS[task.urgency_level] || 48;
-    let deduction = 0;
-    if (task.urgency_level === "critical") deduction = 10;
-    else if (task.urgency_level === "high") deduction = 5;
-    else if (task.urgency_level === "medium") deduction = 3;
-    else deduction = 1;
+    const deduction = computeDeduction(task.urgency_level);
 
     db.prepare(
       "UPDATE collaboration_tasks SET is_overdue = 1, score_deducted = ?, status = 'overdue' WHERE id = ?",
@@ -626,6 +664,8 @@ app.get("/api/tasks", (req, res) => {
     sort,
   } = req.query;
 
+  refreshAllOverdueTasks();
+
   let sql = "SELECT * FROM collaboration_tasks WHERE 1=1";
   const params = [];
 
@@ -675,6 +715,8 @@ app.get("/api/tasks", (req, res) => {
 
 app.get("/api/tasks/department/:dept/summary", (req, res) => {
   const { dept } = req.params;
+
+  refreshAllOverdueTasks();
 
   const pendingAck = db
     .prepare(
@@ -933,10 +975,7 @@ app.post("/api/tasks/:id/complete", (req, res) => {
   let finalDeduction = task.score_deducted || 0;
 
   if (!task.is_overdue && new Date(task.deadline) < new Date(now)) {
-    if (task.urgency_level === "critical") finalDeduction = 10;
-    else if (task.urgency_level === "high") finalDeduction = 5;
-    else if (task.urgency_level === "medium") finalDeduction = 3;
-    else finalDeduction = 1;
+    finalDeduction = computeDeduction(task.urgency_level);
   }
 
   db.prepare(
@@ -995,6 +1034,8 @@ app.post("/api/tasks/:id/complete", (req, res) => {
 
 app.get("/api/stats/tasks/deadline-rate", (req, res) => {
   const { department } = req.query;
+
+  refreshAllOverdueTasks();
 
   let deptCondition = "";
   const params = [];
@@ -1069,6 +1110,8 @@ app.get("/api/stats/tasks/deadline-rate", (req, res) => {
 app.get("/api/stats/tasks/drilldown", (req, res) => {
   const { department, status } = req.query;
 
+  refreshAllOverdueTasks();
+
   let sql = `
     SELECT t.*, i.incident_no, i.type as incident_type, i.hospital, i.type as incident_type_raw
     FROM collaboration_tasks t
@@ -1104,6 +1147,8 @@ app.get("/api/stats/tasks/drilldown", (req, res) => {
 });
 
 app.get("/api/stats/tasks/overview", (req, res) => {
+  refreshAllOverdueTasks();
+
   const total = db
     .prepare("SELECT COUNT(*) as count FROM collaboration_tasks")
     .get().count;
