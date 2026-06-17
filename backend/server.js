@@ -550,7 +550,6 @@ app.get("/api/dict", (req, res) => {
 const checkOverdueAndDeduct = (task, now) => {
   if (
     task.status !== "completed" &&
-    task.status !== "pending_acknowledge" &&
     !task.is_overdue &&
     new Date(task.deadline) < new Date(now)
   ) {
@@ -578,6 +577,19 @@ const checkOverdueAndDeduct = (task, now) => {
     return { is_overdue: 1, score_deducted: deduction, status: "overdue" };
   }
   return null;
+};
+
+const syncOverdueTasks = () => {
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const tasks = db
+    .prepare(
+      "SELECT * FROM collaboration_tasks WHERE status != 'completed' AND is_overdue = 0",
+    )
+    .all();
+
+  for (const task of tasks) {
+    checkOverdueAndDeduct(task, now);
+  }
 };
 
 const enrichTask = (task) => {
@@ -625,6 +637,8 @@ app.get("/api/tasks", (req, res) => {
     incident_id,
     sort,
   } = req.query;
+
+  syncOverdueTasks();
 
   let sql = "SELECT * FROM collaboration_tasks WHERE 1=1";
   const params = [];
@@ -675,6 +689,8 @@ app.get("/api/tasks", (req, res) => {
 
 app.get("/api/tasks/department/:dept/summary", (req, res) => {
   const { dept } = req.params;
+
+  syncOverdueTasks();
 
   const pendingAck = db
     .prepare(
@@ -996,6 +1012,8 @@ app.post("/api/tasks/:id/complete", (req, res) => {
 app.get("/api/stats/tasks/deadline-rate", (req, res) => {
   const { department } = req.query;
 
+  syncOverdueTasks();
+
   let deptCondition = "";
   const params = [];
   if (department && department !== "all") {
@@ -1104,6 +1122,7 @@ app.get("/api/stats/tasks/drilldown", (req, res) => {
 });
 
 app.get("/api/stats/tasks/overview", (req, res) => {
+  syncOverdueTasks();
   const total = db
     .prepare("SELECT COUNT(*) as count FROM collaboration_tasks")
     .get().count;
