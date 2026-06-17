@@ -550,7 +550,6 @@ app.get("/api/dict", (req, res) => {
 const checkOverdueAndDeduct = (task, now) => {
   if (
     task.status !== "completed" &&
-    task.status !== "pending_acknowledge" &&
     !task.is_overdue &&
     new Date(task.deadline) < new Date(now)
   ) {
@@ -578,6 +577,54 @@ const checkOverdueAndDeduct = (task, now) => {
     return { is_overdue: 1, score_deducted: deduction, status: "overdue" };
   }
   return null;
+};
+
+const refreshAllOverdueStatus = () => {
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+
+  const candidates = db
+    .prepare(
+      `SELECT id, urgency_level, receive_department FROM collaboration_tasks
+       WHERE status != 'completed' AND is_overdue = 0 AND deadline < ?`,
+    )
+    .all(now);
+
+  if (candidates.length === 0) return;
+
+  db.prepare(
+    `UPDATE collaboration_tasks
+     SET is_overdue = 1, status = 'overdue',
+         score_deducted = CASE urgency_level
+           WHEN 'critical' THEN 10
+           WHEN 'high' THEN 5
+           WHEN 'medium' THEN 3
+           ELSE 1
+         END,
+         updated_at = ?
+     WHERE status != 'completed' AND is_overdue = 0 AND deadline < ?`,
+  ).run(now, now);
+
+  const insertReceipt = db.prepare(
+    `INSERT INTO task_receipts (task_id, action, department, operator, remark, created_at)
+     VALUES (?, '超时', ?, '系统', ?, ?)`,
+  );
+
+  for (const task of candidates) {
+    const deduction =
+      task.urgency_level === "critical"
+        ? 10
+        : task.urgency_level === "high"
+          ? 5
+          : task.urgency_level === "medium"
+            ? 3
+            : 1;
+    insertReceipt.run(
+      task.id,
+      task.receive_department,
+      `任务已超过时限，扣考核分 ${deduction} 分`,
+      now,
+    );
+  }
 };
 
 const enrichTask = (task) => {
@@ -616,6 +663,8 @@ const enrichTask = (task) => {
 };
 
 app.get("/api/tasks", (req, res) => {
+  refreshAllOverdueStatus();
+
   const {
     status,
     department,
@@ -674,6 +723,8 @@ app.get("/api/tasks", (req, res) => {
 });
 
 app.get("/api/tasks/department/:dept/summary", (req, res) => {
+  refreshAllOverdueStatus();
+
   const { dept } = req.params;
 
   const pendingAck = db
@@ -994,6 +1045,8 @@ app.post("/api/tasks/:id/complete", (req, res) => {
 });
 
 app.get("/api/stats/tasks/deadline-rate", (req, res) => {
+  refreshAllOverdueStatus();
+
   const { department } = req.query;
 
   let deptCondition = "";
@@ -1104,6 +1157,8 @@ app.get("/api/stats/tasks/drilldown", (req, res) => {
 });
 
 app.get("/api/stats/tasks/overview", (req, res) => {
+  refreshAllOverdueStatus();
+
   const total = db
     .prepare("SELECT COUNT(*) as count FROM collaboration_tasks")
     .get().count;
